@@ -1,0 +1,245 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC, SVC
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.feature_selection import SelectFromModel
+from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator
+from sklearn.model_selection import train_test_split
+
+# --- 读取数据 ---
+df = pd.read_csv(r".\heart.csv")
+df['target'] = df['target'].apply(lambda x: 1 if x > 0 else 0)
+X = df.drop('target', axis=1)
+y = df['target']
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Split data and convert to arrays
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+y_train = y_train.values
+y_test = y_test.values
+
+# --- 正则项定义 ---
+def scad_prox(u, lam, a=3.7):
+    """SCAD近端算子实现"""
+    abs_u = np.abs(u)
+    if abs_u <= lam:
+        return 0
+    elif abs_u <= a * lam:
+        return np.sign(u) * (abs_u - lam) / (a - 1)
+    else:
+        return u
+
+
+def mod_scad_prox(u, lam, k=2.0, a=3.7):
+    """Mod-SCAD近端算子实现"""
+    abs_u = np.abs(u)
+    if abs_u <= lam:
+        return np.sign(u) * (lam / k) * ((1 + abs_u) ** k - 1)
+    elif abs_u <= a * lam:
+        term1 = -((1 + lam) ** (k - 1)) / (2 * (a - 1))
+        term2 = (abs_u ** 2 - 2 * a * lam * abs_u + (2 * a - 1) * lam ** 2)
+        constant = (lam / k) * ((1 + lam) ** k - 1)
+        return np.sign(u) * (term1 * term2 + constant)
+    else:
+        term1 = (a - 1) * (1 + lam) ** (k - 1) * lam ** 2 / 2
+        term2 = (lam / k) * ((1 + lam) ** k - 1)
+        return np.sign(u) * (term1 + term2)
+
+
+# --- 自定义非凸回归器 ---
+class CDNonconvexRegressor(BaseEstimator):
+    def __init__(self, penalty='scad', lam=0.1, a=3.7, k=2.0, max_iter=1000, tol=1e-6):
+        self.penalty = penalty
+        self.lam = lam
+        self.a = a
+        self.k = k
+        self.max_iter = max_iter
+        self.tol = tol
+
+    def fit(self, X, y):
+        Xc = X
+        yc = y - y.mean()
+        n, p = Xc.shape
+        w = np.zeros(p)
+        dj = np.sum(Xc ** 2, axis=0) / n
+        for _ in range(self.max_iter):
+            w_old = w.copy()
+            for j in range(p):
+                r_j = yc - (Xc @ w) + Xc[:, j] * w[j]
+                z_j = (Xc[:, j] @ r_j) / n
+                u_j = z_j / (dj[j] + 1e-12)
+                if self.penalty == 'scad':
+                    w[j] = scad_prox(u_j, self.lam, self.a)
+                else:
+                    w[j] = mod_scad_prox(u_j, self.lam, self.k, self.a)
+            if np.linalg.norm(w - w_old) < self.tol:
+                break
+        self.coef_ = w
+        self.intercept_ = y.mean() - np.dot(Xc.mean(axis=0), w)
+        return self
+
+    def predict(self, X):
+        return X @ self.coef_ + self.intercept_
+
+    def get_params(self, deep=True):
+        return {'penalty': self.penalty, 'lam': self.lam, 'a': self.a, 'k': self.k,
+                'max_iter': self.max_iter, 'tol': self.tol}
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+
+# --- 通过10折CV选择lambda_2（AIC和BIC）---
+def select_lambda2_cv(X, y, penalty, lambda_grid, k=None):
+    kf = KFold(n_splits=10, shuffle=True, random_state=42)
+    aic_scores = np.zeros(len(lambda_grid))
+    bic_scores = np.zeros(len(lambda_grid))
+
+    for i, lam in enumerate(lambda_grid):
+        fold_aic = []
+        fold_bic = []
+        for train_idx, val_idx in kf.split(X):
+            X_tr, X_val = X[train_idx], X[val_idx]
+            y_tr, y_val = y[train_idx], y[val_idx]
+            if penalty == 'scad':
+                reg = CDNonconvexRegressor(penalty='scad', lam=lam)
+            else:
+                reg = CDNonconvexRegressor(penalty='mod_scad', lam=lam, k=k)
+            reg.fit(X_tr, y_tr)
+            y_pred = reg.predict(X_val)
+            resid = y_val - y_pred
+            n = len(y_tr)
+            p = np.sum(reg.coef_ != 0)
+            mse = np.mean(resid ** 2)
+            aic = n * np.log(mse) + 2 * p
+            bic = n * np.log(mse) + p * np.log(n)
+            fold_aic.append(aic)
+            fold_bic.append(bic)
+        aic_scores[i] = np.mean(fold_aic)
+        bic_scores[i] = np.mean(fold_bic)
+
+    best_lambda_aic = lambda_grid[np.argmin(aic_scores)]
+    best_lambda_bic = lambda_grid[np.argmin(bic_scores)]
+    return best_lambda_aic, best_lambda_bic
+
+
+# --- 参数网格 ---
+C_grid = np.logspace(-2, 1, 100)  # C from 0.01 to 10, 100 points
+lambda2_grid = np.logspace(-3, 0, 20)  # λ2 grid
+
+# --- SVM-Lasso ---
+svm_lasso = LinearSVC(penalty='l1', dual=False, random_state=42, max_iter=10000)
+param_grid_lasso = {'C': C_grid}
+grid_lasso = GridSearchCV(svm_lasso, param_grid_lasso, cv=10, scoring='roc_auc', n_jobs=-1)
+grid_lasso.fit(X_train, y_train)
+
+# --- SVM-Ridge ---
+svm_ridge = LinearSVC(penalty='l2', random_state=42, max_iter=10000)
+param_grid_ridge = {'C': C_grid}
+grid_ridge = GridSearchCV(svm_ridge, param_grid_ridge, cv=10, scoring='roc_auc', n_jobs=-1)
+grid_ridge.fit(X_train, y_train)
+
+# --- SVM-SCAD ---
+lambda2_aic_scad, lambda2_bic_scad = select_lambda2_cv(X_train, y_train, 'scad', lambda2_grid)
+pipeline_scad = Pipeline([
+    ('selector', SelectFromModel(CDNonconvexRegressor(penalty='scad', lam=lambda2_bic_scad))),
+    ('svm', SVC(probability=True, random_state=42))
+])
+param_grid_scad = {'svm__C': C_grid}
+grid_scad = GridSearchCV(pipeline_scad, param_grid_scad, cv=10, scoring='roc_auc', n_jobs=-1)
+grid_scad.fit(X_train, y_train)
+
+# --- SVM-Mod-SCAD ---
+k_grid = np.logspace(-2, 1, 20)
+best_lambda2_aic_modscad, best_lambda2_bic_modscad = None, None
+best_k = k_grid[0]
+for k in k_grid:
+    lambda2_aic, lambda2_bic = select_lambda2_cv(X_train, y_train, 'mod_scad', lambda2_grid, k=k)
+    if best_lambda2_aic_modscad is None or lambda2_aic < best_lambda2_aic_modscad:
+        best_lambda2_aic_modscad = lambda2_aic
+        best_lambda2_bic_modscad = lambda2_bic
+        best_k = k
+pipeline_modscad = Pipeline([
+    ('selector', SelectFromModel(CDNonconvexRegressor(penalty='mod_scad', lam=best_lambda2_bic_modscad, k=best_k))),
+    ('svm', SVC(probability=True, random_state=42))
+])
+param_grid_modscad = {'svm__C': C_grid}
+grid_modscad = GridSearchCV(pipeline_modscad, param_grid_modscad, cv=10, scoring='roc_auc', n_jobs=-1)
+grid_modscad.fit(X_train, y_train)
+
+
+# --- 评估函数 ---
+def evaluate_model(model, X_test, y_test, is_pipeline=False, lambda2_aic=None, lambda2_bic=None, k=None):
+    if is_pipeline:
+        best_pipe = model.best_estimator_  # 获取最佳 Pipeline
+        y_pred = best_pipe.predict(X_test)
+        y_prob = best_pipe.predict_proba(X_test)[:, 1]
+        selected_features = best_pipe.named_steps['selector'].get_support(indices=True)
+        num_features = len(selected_features)
+    else:
+        y_pred = model.predict(X_test)
+        y_prob = model.decision_function(X_test)
+        coef = model.best_estimator_.coef_
+        num_features = np.sum(coef != 0) if model.best_estimator_.penalty == 'l1' else X_test.shape[1]
+
+    report = classification_report(y_test, y_pred, output_dict=True)
+    auc = roc_auc_score(y_test, y_prob)
+    result = {
+        'Test Error (%)': round((1 - report['accuracy']) * 100, 2),
+        'Sensitivity (%)': round(report['1']['recall'] * 100, 2),
+        'Specificity (%)': round(report['0']['recall'] * 100, 2),
+        'AUC': round(auc, 4),
+        'Selected Features': num_features,
+        'Best λ1': round(1 / model.best_params_['C'], 4) if not is_pipeline else round(1 / model.best_params_['svm__C'], 4)
+    }
+    if is_pipeline:
+        result['Best λ2 (AIC)'] = lambda2_aic
+        result['Best λ2 (BIC)'] = lambda2_bic
+        if k is not None:
+            result['Best k'] = k
+    return result
+
+
+# --- 收集结果 ---
+results = {}
+
+results['Lasso'] = evaluate_model(grid_lasso, X_test, y_test)
+results['Ridge'] = evaluate_model(grid_ridge, X_test, y_test)
+results['SCAD'] = evaluate_model(grid_scad, X_test, y_test, is_pipeline=True,
+                                 lambda2_aic=lambda2_aic_scad, lambda2_bic=lambda2_bic_scad)
+results['Mod-SCAD'] = evaluate_model(grid_modscad, X_test, y_test, is_pipeline=True,
+                                     lambda2_aic=best_lambda2_aic_modscad, lambda2_bic=best_lambda2_bic_modscad,
+                                     k=best_k)
+
+# --- 输出结果 ---
+print("\n=== 分类结果比较表 ===")
+df_result = pd.DataFrame(results).T
+print(df_result.to_string())
+print("\n=== 各方法所选择的特征 ===")
+feature_names = X.columns
+
+# Lasso
+coef_lasso = grid_lasso.best_estimator_.coef_.flatten()
+selected_lasso = feature_names[np.where(coef_lasso != 0)]
+print("Lasso selected features:", list(selected_lasso))
+
+# Ridge（不会做特征选择，使用全部特征）
+print("Ridge selected features: 使用所有特征（无特征选择）")
+
+# SCAD
+selector_scad = grid_scad.best_estimator_.named_steps['selector']
+selected_scad = feature_names[selector_scad.get_support()]
+print("SCAD selected features:", list(selected_scad))
+
+# Mod-SCAD
+selector_modscad = grid_modscad.best_estimator_.named_steps['selector']
+selected_modscad = feature_names[selector_modscad.get_support()]
+print("Mod-SCAD selected features:", list(selected_modscad))
